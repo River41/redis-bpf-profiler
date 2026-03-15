@@ -1,6 +1,7 @@
 # --- 编译产物 (Build Artifacts) ---
 # 最终的可执行二进制文件
 redis_monitor
+redis_latency
 
 # 中间的对象文件
 *.o
