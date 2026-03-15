@@ -3,19 +3,19 @@
 typedef uint32_t u32;
 #include "redis_monitor.skel.h"
 
-// 错误处理回调
+// Error handling callback
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-    // 如果是警告级别，打印红色的 [ERROR] 标签
+    // If the level is WARN, print a red [ERROR] tag
     if (level == LIBBPF_WARN) {
-        // \033[1;31m 是加粗红色的代码，\033[0m 是重置颜色的代码
+        // \033[1;31m is the code for bold red, \033[0m resets the color
         fprintf(stderr, "\033[1;31m[ERROR]\033[0m ");
     } else if (level == LIBBPF_INFO) {
-        // 也可以给普通信息加个绿色的 [INFO]
+        // We can also add a green [INFO] for normal messages
         fprintf(stderr, "\033[1;32m[INFO]\033[0m  ");
     }
 
-    // 转发原始的日志信息
+    // Forward the original log message
     return vfprintf(stderr, format, args);
 }
 
@@ -25,24 +25,24 @@ int main(int argc, char **argv)
     int err;
     u32 redis_pid = 0;
 
-    // 简单起见，我们从命令行参数读 PID：./redis_monitor 1234
+    // For simplicity, we read the PID from command line arguments: ./redis_monitor 1234
     if (argc > 1) {
         redis_pid = strtoul(argv[1], NULL, 10);
     }
 
-    /* 设置 libbpf 的错误和信息打印回调 */
+    /* Set the libbpf error and info print callback */
     libbpf_set_print(libbpf_print_fn);
 
-    skel = redis_monitor_bpf__open(); // 注意：这里先 open，不直接 load
+    skel = redis_monitor_bpf__open(); // Note: open first, don't load directly
     if (!skel) return 1;
 
-    /* 在 load 之前，修改内核态的全局变量 */
+    /* Before loading, modify the kernel-space global variable */
     if (redis_pid > 0) {
         skel->rodata->target_pid = redis_pid;
         printf("Filtering for Redis PID: %u\n", redis_pid);
     }
 
-    err = redis_monitor_bpf__load(skel); // 然后再真正加载进内核
+    err = redis_monitor_bpf__load(skel); // Then, actually load it into the kernel
 
     if (err) {
         fprintf(stderr, "Failed to load BPF skeleton\n");

@@ -1,30 +1,47 @@
-BPF_SRC = src/bpf/redis_monitor.bpf.c
-USER_SRC = src/user/redis_monitor.c
-OUTPUT = .
-BPF_OBJ = $(OUTPUT)/redis_monitor.bpf.o
-SKEL_H = $(OUTPUT)/redis_monitor.skel.h
-TARGET = redis_monitor
-
-
-CLANG = clang
+# Common variables
+ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+CC = clang
 BPFTOOL = bpftool
-CFLAGS = -g -O2 -Wall -I. -I./src/user
 
-all: $(TARGET)
+# Common flags
+CFLAGS = -g -O2 -Wall
+LDFLAGS = -lbpf -lelf -lz
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
 
-# 1.
-$(BPF_OBJ): $(BPF_SRC) vmlinux.h
-	$(CLANG) $(CFLAGS) -target bpf -D__TARGET_ARCH_arm64 -c $(BPF_SRC) -o $@
+# Include paths for user-space and BPF sources
+# We add '.' to the path so that source files can find generated headers
+# and vmlinux.h in the project root.
+INCLUDES = -I.
 
-# 2. Skeleton
-$(SKEL_H): $(BPF_OBJ)
-	$(BPFTOOL) gen skeleton $(BPF_OBJ) > $(SKEL_H)
+# List of all executables to build
+TARGETS = redis_monitor redis_latency
 
-# 3.
-$(TARGET): $(USER_SRC) $(SKEL_H)
-	$(CLANG) $(CFLAGS) $(USER_SRC) -lbpf -lelf -lz -o $@
+# Default target: build all executables
+.PHONY: all
+all: $(TARGETS)
 
+# Rule to generate vmlinux.h for CO-RE. This is a file target, so 'make'
+# will automatically run this rule if vmlinux.h is missing.
+vmlinux.h:
+	@echo "  GEN-CORE  $@"
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+# Generic rule for building user-space applications.
+# It depends on the corresponding C source and the generated skeleton header.
+# e.g., redis_monitor: src/user/redis_monitor.c redis_monitor.skel.h
+$(TARGETS): %: src/user/%.c %.skel.h
+	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS)
+
+# Generic rule for generating skeleton headers from BPF object files.
+%.skel.h: %.bpf.o
+	$(BPFTOOL) gen skeleton $< > $@
+
+# Generic rule for compiling BPF C code into BPF object files.
+# It depends on the BPF source file and vmlinux.h for CO-RE.
+%.bpf.o: src/bpf/%.bpf.c vmlinux.h
+	$(CC) $(BPF_CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Phony target to clean up all generated files
+.PHONY: clean
 clean:
-	rm -f $(BPF_OBJ) $(SKEL_H) $(TARGET)
-
-.PHONY: all clean
+	rm -f $(TARGETS) *.bpf.o *.skel.h vmlinux.h
