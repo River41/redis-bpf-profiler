@@ -1,7 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-
+#include "../redis_metadata.h"
 
 #define CLIENT_ARGC_OFFSET 88
 #define CLIENT_ARGV_OFFSET 96
@@ -9,22 +9,33 @@
 
 // Forward declarations for structs we are probing from userspace.
 // These definitions do not need to be complete, as we only need the type.
-struct redisCommand;
 struct client;
 struct redisObject; // In Redis, this is the `robj` type
 
-// Define a Hash Map to store the entry timestamp for each thread
+struct session {
+    // Stores metadata about a command at its entry point.
+    unsigned long long start_ts;
+    char cmd[16];
+    int argc;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024); // Sufficient for single-threaded Redis
-    __type(key, u32);   // Key is Thread ID (TID)
-    __type(value, u64); // Value is the entry timestamp (nanoseconds)
-} start_times SEC(".maps");
+    __uint(max_entries, 1024);
+    __type(key, u32);              // Key: Thread ID (TID)
+    __type(value, struct session); // Value: Session metadata
+} start_sessions SEC(".maps");
 
-// Optional PID filter passed from user space
+// Ring buffer to send events from kernel to user space.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256KB buffer
+} rb SEC(".maps");
+
+// Optional PID filter. Set from user space to trace a specific process.
 volatile const u32 target_pid = 0;
 
-// 1. Probe at function entry (Uprobe)
+// This uprobe is triggered at the entry of the `processCommand` function in Redis.
 SEC("uprobe")
 int BPF_UPROBE(process_command_entry)
 {
@@ -33,6 +44,7 @@ int BPF_UPROBE(process_command_entry)
     if (!client_ptr_val)
         return 0;
 
+    // Get the Process ID (PID) and Thread ID (TID).
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = id >> 32;
     u32 tid = (u32)id;
@@ -41,8 +53,8 @@ int BPF_UPROBE(process_command_entry)
     if (target_pid != 0 && pid != target_pid)
         return 0;
 
-    // This chain of reads traverses Redis's internal structures to get the command name.
-    // It's equivalent to: `(char *)c->argv[0]->ptr`
+    // The following chain of reads traverses Redis's internal structures to get
+    // the command name. It is equivalent to C-like access: `(char *)c->argv[0]->ptr`
 
     // 1. Read `c->argv` pointer.
     struct redisObject **argv_ptr;
@@ -71,38 +83,49 @@ int BPF_UPROBE(process_command_entry)
     bpf_probe_read_user_str(&cmdname, sizeof(cmdname), string_ptr);
 
     // 5. Read `c->argc` for additional context.
-    int argc;
-    bpf_probe_read_user(&argc, sizeof(argc), (void *)(client_ptr_val + CLIENT_ARGC_OFFSET));
+    int current_argc;
+    bpf_probe_read_user(&current_argc, sizeof(current_argc), (void *)(client_ptr_val + CLIENT_ARGC_OFFSET));
 
-    // 6. Print the result.
-    bpf_printk("Redis command: %s (argc: %d)\n", cmdname, argc);
+    // For debugging: print the captured command to the kernel trace pipe.
+    bpf_printk("Redis command: %s (argc: %d)\n", cmdname, current_argc);
 
-    // Store the entry timestamp in the map
-    u64 ts = bpf_ktime_get_ns();
-    bpf_map_update_elem(&start_times, &tid, &ts, BPF_ANY);
+    // Store the session information in a map, keyed by the thread ID.
+    // This allows the return probe to look up the start time and command details.
+    struct session s = {};
+    s.start_ts = bpf_ktime_get_ns();
+    s.argc = current_argc;
+    bpf_probe_read_user_str(&s.cmd, sizeof(s.cmd), string_ptr);
+
+    bpf_map_update_elem(&start_sessions, &tid, &s, BPF_ANY);
     return 0;
 }
 
-// 2. Probe at function exit (Uretprobe)
+// This uretprobe is triggered at the exit of the `processCommand` function.
 SEC("uretprobe")
-int BPF_URETPROBE(process_command_exit)
-{
-    u64 id = bpf_get_current_pid_tgid();
-    u32 tid = (u32)id;
+int BPF_URETPROBE(process_command_exit) {
+    u32 tid = (u32)bpf_get_current_pid_tgid();
 
-    // Look up the corresponding entry time from the map
-    u64 *start_ts = bpf_map_lookup_elem(&start_times, &tid);
-    if (!start_ts)
-        return 0;
+    // Look up the session info stored by the entry probe.
+    struct session *s = bpf_map_lookup_elem(&start_sessions, &tid);
+    if (!s) return 0;
 
-    u64 end_ts = bpf_ktime_get_ns();
-    u64 delta = end_ts - *start_ts;
+    // Calculate the command execution time.
+    unsigned long long delta = bpf_ktime_get_ns() - s->start_ts;
 
-    // Print latency. The indentation makes it easy to associate with the command.
-    bpf_printk("  -> latency: %llu ns\n", delta);
+    // Reserve space on the ring buffer for the event.
+    struct event *e;
+    e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+    if (e) {
+        // Populate the event with command details and latency.
+        __builtin_memcpy(e->cmd, s->cmd, sizeof(e->cmd));
+        e->argc = s->argc;
+        e->latency_ns = delta;
+        // Submit the event to the ring buffer for user-space to consume.
+        bpf_ringbuf_submit(e, 0);
+    }
 
-    // Delete after use to free up map space
-    bpf_map_delete_elem(&start_times, &tid);
+    // Clean up the session from the map.
+    bpf_map_delete_elem(&start_sessions, &tid);
     return 0;
 }
 
