@@ -7,11 +7,37 @@
 #include <errno.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
+#include <time.h>
 #include <gelf.h>
 #include <libelf.h>
 
+#include "../redis_metadata.h"
+
 typedef uint32_t u32;
 #include "redis_latency.skel.h"
+
+static volatile bool exiting = false;
+
+static void sig_handler(int sig) {
+    exiting = true;
+}
+
+static int handle_event(void *ctx, void *data, size_t data_sz) {
+    const struct event *e = data;
+    struct tm *tm;
+    char ts[32];
+    time_t t;
+
+    time(&t);
+    tm = localtime(&t);
+    strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+
+    // 打印漂亮的表格行：时间、命令、参数个数、延迟(微秒)
+    printf("%-10s %-12s %-8u %-10.2f\n", 
+           ts, e->cmd, e->argc, e->latency_ns / 1000.0);
+
+    return 0;
+}
 
 // libbpf error and info print callback
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -21,12 +47,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
         fprintf(stderr, "\033[1;31m[LIBBPF]\033[0m ");
     }
     return vfprintf(stderr, format, args);
-}
-
-static volatile bool exiting = false;
-
-static void sig_handler(int sig) {
-    exiting = true;
 }
 
 /**
@@ -99,6 +119,7 @@ cleanup:
 
 int main(int argc, char **argv) {
     struct redis_latency_bpf *skel;
+    struct ring_buffer *rb = NULL;
     int err;
 
     if (argc < 3) {
@@ -167,9 +188,25 @@ int main(int argc, char **argv) {
     printf("Check kernel trace pipe for output: sudo cat /sys/kernel/debug/tracing/trace_pipe\n");
     printf("Press Ctrl-C to exit.\n");
 
+    // 1. 初始化 Ring Buffer 监听器
+    // "rb" 对应我们在 .bpf.c 里定义的 SEC(".maps") 中的那个 rb
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+    if (!rb) {
+        fprintf(stderr, "Failed to create ring buffer\n");
+        goto cleanup;
+    }
+
+    printf("\n%-10s %-12s %-8s %-10s\n", "TIME", "COMMAND", "ARGC", "LATENCY(us)");
+    printf("----------------------------------------------------------\n");
+
+    // 2. 进入情报轮询循环
     while (!exiting) {
-        // Sleep to reduce CPU usage. The BPF program runs in the kernel anyway.
-        sleep(1);
+        err = ring_buffer__poll(rb, 100 /* 100毫秒超时一次，方便检查退出信号 */);
+        if (err == -EINTR) continue;
+        if (err < 0) {
+            printf("Error polling ring buffer: %d\n", err);
+            break;
+        }
     }
 
 cleanup:
